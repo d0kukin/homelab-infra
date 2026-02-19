@@ -1,0 +1,30 @@
+*mangle
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+# MSS clamping — VXLAN MTU 1450, MSS = 1450 - 40 = 1410
+-A FORWARD -i vmbr1 -o wlp2s0 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1410
+-A FORWARD -i wlp2s0 -o vmbr1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1410
+COMMIT
+
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+# VXLAN between cluster nodes
+-A INPUT -s 10.10.10.0/24 -p udp -m udp --dport 4789 -j ACCEPT
+# VM internet access via NAT
+-A FORWARD -i vmbr1 -o wlp2s0 -j ACCEPT
+-A FORWARD -i wlp2s0 -o vmbr1 -m state --state RELATED,ESTABLISHED -j ACCEPT
+COMMIT
+
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+# NAT for VM subnet
+-A POSTROUTING -s 10.10.20.0/24 -o wlp2s0 -j MASQUERADE
+COMMIT

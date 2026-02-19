@@ -1,0 +1,7 @@
+*.key
+*.pem
+*.secret
+wpa_supplicant.conf
+**/wpa_supplicant.conf
+**/*wpa_supplicant*
+
