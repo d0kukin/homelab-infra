@@ -1,0 +1,15 @@
+#version:1
+
+auto vmnet
+iface vmnet
+	bridge_ports vxlan_vmnet
+	bridge_stp off
+	bridge_fd 0
+	mtu 1450
+
+auto vxlan_vmnet
+iface vxlan_vmnet
+	vxlan-id 20
+	vxlan_remoteip 10.10.10.3
+	vxlan_remoteip 10.10.10.4
+	mtu 1450
