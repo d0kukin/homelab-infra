@@ -326,7 +326,7 @@ address=/pve3.lab.internal/10.10.20.3
 
 # Static DHCP reservations (add as needed)
 # dhcp-host=MAC,hostname,IP
-# dhcp-host=BC:24:11:AA:BB:CC,k8s-master-1,10.10.20.10
+# dhcp-host=BC:24:11:AA:BB:CC,k8s-master-1,10.10.20.10,infinite
 
 # ---- Logging (disable after testing) ----
 log-queries
@@ -648,8 +648,8 @@ qm config 101 | grep net0
 vim /etc/dnsmasq.d/homelab.conf
 
 # --- ADD in DHCP section ---
-# dhcp-host=XX:XX:XX:XX:XX:XX,test-vm,10.10.20.10
-# dhcp-host=YY:YY:YY:YY:YY:YY,test-vm-2,10.10.20.11
+# dhcp-host=XX:XX:XX:XX:XX:XX,test-vm,10.10.20.10,infinite
+# dhcp-host=YY:YY:YY:YY:YY:YY,test-vm-2,10.10.20.11,infinite
 # --- END ---
 
 # --- ADD in DNS section ---
@@ -657,15 +657,17 @@ vim /etc/dnsmasq.d/homelab.conf
 # address=/test-vm-2.lab.internal/10.10.20.11
 # --- END ---
 
-# Reload dnsmasq
-systemctl restart dnsmasq
+# Reload dnsmasq (reload не дропает активные leases, в отличие от restart)
+systemctl reload dnsmasq
 
-# Force VMs to renew lease
+# Force VMs to renew lease (только если нужно применить немедленно)
+# При следующем обычном renew VM получит зарезервированный IP автоматически
 qm reboot 101
 qm reboot 102
 
 # Verify
 cat /var/lib/misc/dnsmasq.leases
+# Lease timestamp 0 = infinite
 dig @10.10.20.1 test-vm.lab.internal +short
 
 
@@ -673,13 +675,10 @@ dig @10.10.20.1 test-vm.lab.internal +short
 STEP 12: DISABLE dnsmasq LOGGING (after testing)
 ================================================================================
 
-vim /etc/dnsmasq.d/homelab.conf
-# Comment out or remove:
-#   log-queries
-#   log-dhcp
-#   log-facility=/var/log/dnsmasq.log
+sed -i 's/^log-queries/#log-queries/; s/^log-dhcp/#log-dhcp/; s/^log-facility=/#log-facility=/' /etc/dnsmasq.d/homelab.conf
 
-systemctl restart dnsmasq
+dnsmasq --test
+systemctl reload dnsmasq
 
 
 ================================================================================
@@ -832,7 +831,9 @@ NOTES
 - sysctl: ip_forward and tcp_mtu_probing are persisted in
   /etc/sysctl.d/99-forwarding.conf.
 
-- DHCP lease time is 12h. If pve1 is down <12h, VMs keep IPs.
+- DHCP lease time: 12h для dynamic pool (10.10.20.100-200).
+  Static reservations используют infinite lease (dhcp-host=MAC,name,IP,infinite).
+  systemctl reload не дропает активные leases.
 
 - dhclient on wlp2s0 overwrites /etc/resolv.conf with router DNS.
   /etc/dhcp/dhclient.conf with "supersede" forces dnsmasq as primary.
