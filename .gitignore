@@ -6,50 +6,44 @@ id_ed25519
 id_ecdsa
 authorized_keys
 known_hosts
-
 # === SSL/TLS ===
 *.crt
 *.cert
 *.p12
 *.pfx
 *.der
-
 # === Proxmox private files ===
 # /etc/pve/priv/
 **/pve/priv/
 **/corosync/authkey
 pve-root-ca.key
-
 # === WiFi / network secrets ===
 wpa_supplicant.conf
 **/wpa_supplicant.conf
 **/*wpa_supplicant*
 **/*nm-system-connections*
 /etc/NetworkManager/
-
 # === Ansible ===
 *.vault
 .vault_pass
 vault_pass.txt
 *vault_password*
 **/.ansible/
-
 # === common secrets ===
 .env
 .env.*
+*.env
 *.secret
 *.token
 *_password
 *_passwd
 *credentials*
-
 # === secrets/ only ansible-vault ===
 secrets/*.yaml
 secrets/*.yml
 secrets/*.conf
 secrets/*.txt
 !secrets/README.md
-
 # === temp & OS ===
 *.swp
 *.swo
@@ -58,4 +52,3 @@ secrets/*.txt
 Thumbs.db
 *.bak
 *.tmp
-

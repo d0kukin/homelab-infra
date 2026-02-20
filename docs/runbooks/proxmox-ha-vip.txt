@@ -1,0 +1,373 @@
+================================================================================
+RUNBOOK: Proxmox Management UI — HA VIP (keepalived + HAProxy)
+================================================================================
+Tested on:  Proxmox VE 9.x (Debian Trixie), 3x mini-PCs, Wi-Fi only uplink
+Prereq:     Working 3-node cluster, SDN vmnet configured (see sdn-vxlan-nat runbook)
+Goal:       Single stable entry point https://<VIP>:8006 для Proxmox UI.
+            VIP плавает между нодами — при уходе ноды на maintenance UI доступен.
+================================================================================
+
+ARCHITECTURE
+================================================================================
+
+  Сеть доступа:  192.168.31.0/24 (Wi-Fi, Xiaomi Redmi роутер)
+  VIP:           <VIP>/24  — вне DHCP-пула роутера, никому не выдаётся
+                            (см. automation/scripts/vip.env)
+  Interface:     wlp2s0 (Wi-Fi) — единственный интерфейс доступный с ноутбука
+
+  Node Wi-Fi IPs (зафиксировать DHCP-резервированием на роутере!):
+    pve1  <WIFI_IP_PVE1>   MAC <MAC_PVE1>
+    pve2  <WIFI_IP_PVE2>   MAC <MAC_PVE2>
+    pve3  <WIFI_IP_PVE3>   MAC <MAC_PVE3>
+
+  Реальные значения — в automation/scripts/vip.env (gitignored).
+
+  VRRP режим: UNICAST (Wi-Fi не поддерживает multicast 224.0.0.18 —
+              роутер не проксирует между клиентами)
+  Приоритеты:
+    pve1  priority 150  — обычный держатель VIP
+    pve2  priority 140
+    pve3  priority 130
+
+  nopreempt: VIP не возвращается автоматически на старшую ноду после
+  её восстановления. Избегает лишних переключений и разрыва сессий.
+
+  Check script: pidof haproxy + pidof pveproxy.
+  Не требует sudo — pidof работает от любого юзера.
+  User: keepalived_script (system user, nologin).
+
+  HAProxy: mode tcp, balance source (sticky по src IP), ssl-hello-chk.
+  Backends используют Wi-Fi IP нод (<WIFI_IP_PVEx>:8006).
+
+  ВАЖНО про сессии Proxmox UI:
+    PVEAuthCookie валидируется только на ноде где была создана.
+    При переезде VIP на другую ноду — ре-логин неизбежен (~5 секунд).
+    Это архитектурное ограничение Proxmox, не баг конфигурации.
+    Цветовая схема и настройки UI хранятся в localStorage браузера
+    и привязаны к origin https://<VIP>:8006 — не слетают при failover.
+
+  Firewall: iptables-legacy, PVE Firewall ВЫКЛЮЧЕН (как в sdn-vxlan-nat runbook).
+  VRRP unicast использует UDP между Wi-Fi IP нод — не конфликтует с
+  существующими iptables правилами (те правила на vmbr0/vmnet).
+
+
+================================================================================
+CONFIGURATION (секреты)
+================================================================================
+
+  Все чувствительные и окружение-специфичные значения вынесены в:
+    automation/scripts/vip.env   ← gitignored, не коммитится
+    automation/scripts/vip.env.example  ← шаблон, коммитится
+
+  Перед первым запуском:
+    cp automation/scripts/vip.env.example automation/scripts/vip.env
+    # Заполнить реальными значениями
+
+
+================================================================================
+STEP 0: PREREQUISITES
+================================================================================
+
+# Заполнен vip.env?
+cat automation/scripts/vip.env
+
+# Кластер здоров?
+pvecm status
+# Expected: Quorate: Yes, Nodes: 3
+
+# VIP свободен?
+ping -c 1 <VIP>
+# Expected: 100% packet loss
+
+# DHCP резервирование на роутере (по MAC → фиксированный IP для каждой ноды):
+# Без резервирования: после ребута ноды keepalived unicast_peer протухнет
+# ip link show wlp2s0 | grep "link/ether"  — MAC адрес ноды
+
+
+================================================================================
+STEP 1: INSTALL PACKAGES
+================================================================================
+
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  echo "=== $node ==="
+  ssh root@$node 'apt install -y keepalived haproxy sudo'
+done
+
+
+================================================================================
+STEP 2: CREATE keepalived_script USER
+================================================================================
+
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  ssh root@$node 'id keepalived_script &>/dev/null \
+    || useradd -r -s /sbin/nologin -M keepalived_script'
+  ssh root@$node 'id keepalived_script'
+done
+
+
+================================================================================
+STEP 3: HEALTH CHECK SCRIPT
+================================================================================
+
+# pidof не требует sudo — работает от keepalived_script без привилегий.
+# pveproxy сам падает при проблемах с кластером — отдельная проверка pvecm не нужна.
+
+cat > /tmp/chk_pve_vip.sh << 'EOF'
+#!/bin/sh
+pidof haproxy  > /dev/null 2>&1 || exit 1
+pidof pveproxy > /dev/null 2>&1 || exit 1
+exit 0
+EOF
+
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  scp /tmp/chk_pve_vip.sh root@$node:/usr/local/sbin/chk_pve_vip.sh
+  ssh root@$node 'chmod +x /usr/local/sbin/chk_pve_vip.sh'
+done
+
+# Verify — запустить от имени keepalived_script
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  echo "=== $node ==="
+  ssh root@$node 'su -s /bin/sh keepalived_script \
+    -c "/usr/local/sbin/chk_pve_vip.sh" && echo "CHECK OK" || echo "CHECK FAILED"'
+done
+# Expected: CHECK OK на всех трёх нодах
+
+
+================================================================================
+STEP 4: CONFIGURE HAProxy (одинаково на всех нодах)
+================================================================================
+
+# Backends — Wi-Fi IP (192.168.31.x), НЕ management IP (10.10.10.x).
+# mode tcp — HAProxy не расшифровывает TLS, проксирует насквозь.
+# balance source — sticky по src IP, сессия не ломается при живых нодах.
+# ssl-hello-chk — проверяет что бэкенд отвечает по TLS.
+
+# Сгенерировать конфиг из vip.env и раскатить:
+bash automation/scripts/setup-vip.sh   # шаг 4 встроен в скрипт
+
+# Или вручную — подставить <WIFI_IP_PVEx> из vip.env:
+cat > /tmp/haproxy.cfg << 'EOF'
+global
+  log /dev/log local0
+  maxconn 4096
+  daemon
+
+defaults
+  log global
+  mode tcp
+  option tcplog
+  timeout connect 5s
+  timeout client  60s
+  timeout server  60s
+
+frontend pve_ui
+  bind *:8006
+  default_backend pve_nodes
+
+backend pve_nodes
+  balance source
+  option ssl-hello-chk
+  server pve1 <WIFI_IP_PVE1>:8006 check inter 2s fall 3 rise 2 ssl verify none
+  server pve2 <WIFI_IP_PVE2>:8006 check inter 2s fall 3 rise 2 ssl verify none
+  server pve3 <WIFI_IP_PVE3>:8006 check inter 2s fall 3 rise 2 ssl verify none
+EOF
+
+# Verify — HAProxy слушает на 8006
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  echo "=== $node ==="
+  ssh root@$node 'ss -tlnp | grep 8006'
+done
+# Expected: 0.0.0.0:8006 LISTEN на каждой ноде
+
+
+================================================================================
+STEP 5: CONFIGURE keepalived (на каждой ноде свой unicast_src_ip и priority)
+================================================================================
+
+# UNICAST обязателен для Wi-Fi — multicast блокируется роутером.
+# auth_pass ограничен 8 символами keepalived — длиннее молча обрезается.
+# Все три ноды state BACKUP — нода с наибольшим priority сама станет MASTER.
+# Проще всего запустить setup-vip.sh — он генерирует конфиги из vip.env.
+
+# Шаблон конфига (подставить значения из vip.env):
+
+# global_defs {
+#   enable_script_security
+#   script_user keepalived_script
+# }
+#
+# vrrp_script chk_pve_vip {
+#   script "/usr/local/sbin/chk_pve_vip.sh"
+#   interval 2
+#   fall 2
+#   rise 2
+# }
+#
+# vrrp_instance VI_PVE {
+#   state BACKUP
+#   interface <INTERFACE>          # wlp2s0
+#   virtual_router_id <VRID>       # одинаков на всех нодах
+#   priority <PRIORITY>            # 150 / 140 / 130
+#   advert_int 1
+#   nopreempt
+#
+#   unicast_src_ip <WIFI_IP_THIS_NODE>
+#   unicast_peer {
+#     <WIFI_IP_OTHER_NODE_1>
+#     <WIFI_IP_OTHER_NODE_2>
+#   }
+#
+#   authentication {
+#     auth_type PASS
+#     auth_pass <AUTH_PASS>        # max 8 символов
+#   }
+#
+#   virtual_ipaddress {
+#     <VIP>/<VIP_PREFIX> dev <INTERFACE>
+#   }
+#
+#   track_script {
+#     chk_pve_vip
+#   }
+# }
+
+# Syntax check
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  echo "=== $node ==="
+  ssh root@$node 'keepalived -t -f /etc/keepalived/keepalived.conf 2>&1 | tail -3'
+done
+
+
+================================================================================
+STEP 6: START keepalived
+================================================================================
+
+# pve1 первым — наибольший priority, возьмёт VIP
+systemctl enable --now keepalived
+sleep 4
+
+ssh root@10.10.10.3 'systemctl enable --now keepalived'
+ssh root@10.10.10.4 'systemctl enable --now keepalived'
+sleep 3
+
+# Verify — VIP только на pve1
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  echo -n "$node: "
+  ssh root@$node 'ip a show wlp2s0 | grep "inet <VIP>/" \
+    && echo "HAS VIP" || echo "no vip"'
+done
+
+
+================================================================================
+STEP 7: TEST FAILOVER
+================================================================================
+
+# Снимаем VIP с pve1
+systemctl stop keepalived
+sleep 5
+
+# VIP должен переехать на pve2
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  echo -n "$node: "
+  ssh root@$node 'ip a show wlp2s0 | grep "inet <VIP>/" \
+    && echo "HAS VIP" || echo "no vip"'
+done
+
+# UI доступен с ноутбука?
+curl -k -o /dev/null -s -w "HTTP %{http_code}\n" https://<VIP>:8006
+# Expected: HTTP 200
+
+# Возвращаем pve1 (VIP останется на pve2 из-за nopreempt — это нормально)
+systemctl start keepalived
+
+
+================================================================================
+MAINTENANCE PROCEDURE
+================================================================================
+
+# Уход ноды на обслуживание без потери доступа к UI:
+
+# 1. Если нода — текущий держатель VIP:
+systemctl stop keepalived
+# VIP переедет на следующую ноду (~5 секунд)
+# Пользователи получат ре-логин — это ожидаемо
+
+# 2. Обслуживание...
+
+# 3. Возврат:
+systemctl start keepalived
+# VIP не вернётся автоматически (nopreempt)
+# Вернуть VIP принудительно — на текущем держателе: systemctl restart keepalived
+
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+# keepalived не стартует
+  journalctl -u keepalived --no-pager -n 30
+  keepalived -t -f /etc/keepalived/keepalived.conf        # syntax check
+
+# VIP не появляется
+  journalctl -u keepalived -f &
+  # Частые причины:
+  #  "Script user does not exist" → useradd -r -s /sbin/nologin -M keepalived_script
+  #  "script now returning 1"     → проверить chk_pve_vip.sh (см. ниже)
+  #  "Truncating auth_pass"       → warning, не ошибка (max 8 символов)
+
+# Check script фейлится
+  su -s /bin/sh keepalived_script \
+    -c "/usr/local/sbin/chk_pve_vip.sh" && echo OK || echo FAIL
+  pidof haproxy   # haproxy запущен?
+  pidof pveproxy  # pveproxy запущен?
+
+# VIP на нескольких нодах (split-brain)
+  # Причина: unicast UDP не доходит между нодами
+  tcpdump -i wlp2s0 udp port 112 -c 10
+  grep virtual_router_id /etc/keepalived/keepalived.conf  # одинаков на всех?
+  grep auth_pass /etc/keepalived/keepalived.conf          # одинаков (до 8 символов)?
+
+# HAProxy не проксирует
+  haproxy -c -f /etc/haproxy/haproxy.cfg
+  ss -tlnp | grep 8006
+  # Прямой доступ к бэкендам:
+  curl -k -o /dev/null -s -w "%{http_code}\n" https://<WIFI_IP_PVE1>:8006
+  curl -k -o /dev/null -s -w "%{http_code}\n" https://<WIFI_IP_PVE2>:8006
+  curl -k -o /dev/null -s -w "%{http_code}\n" https://<WIFI_IP_PVE3>:8006
+
+# 401 после переезда VIP
+  # Нормально — PVEAuthCookie привязан к ноде. Залогиниться заново.
+
+# После ребута VIP не работает
+  systemctl is-enabled keepalived
+  # Проверить что Wi-Fi IP ноды не изменился (нужно DHCP-резервирование!)
+  ip a show wlp2s0 | grep inet
+
+
+================================================================================
+CONFIG FILE LOCATIONS
+================================================================================
+
+  /etc/keepalived/keepalived.conf     — per-node: VRRP (priority разный!)
+  /usr/local/sbin/chk_pve_vip.sh      — per-node: health check (одинаковый)
+  /etc/haproxy/haproxy.cfg            — per-node: HAProxy (одинаковый)
+  automation/scripts/vip.env          — локально: секреты (gitignored)
+  automation/scripts/vip.env.example  — шаблон (в git)
+
+
+================================================================================
+NOTES
+================================================================================
+
+- Unicast VRRP: каждая нода шлёт адверты напрямую peers по UDP.
+  Multicast (224.0.0.18) не работает на Wi-Fi — домашний роутер блокирует.
+- auth_pass обрезается keepalived до 8 символов.
+- nopreempt: VIP не возвращается автоматически. Предотвращает лишние
+  переключения при кратком моргании ноды.
+- HAProxy balance source: клиент попадает на ту же ноду пока она жива.
+  При падении ноды HAProxy переключает на живую — ре-логин неизбежен.
+- Браузер покажет предупреждение о сертификате (выдан на реальный IP ноды,
+  а ты ходишь на VIP) — принять исключение один раз.
+- DHCP резервирование на роутере критично: без него unicast_peer протухает
+  после ребута ноды и нода выпадает из VRRP.
+================================================================================
