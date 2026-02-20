@@ -1,0 +1,898 @@
+================================================================================
+RUNBOOK: Proxmox Network — SDN VXLAN + dnsmasq + NAT (v2)
+================================================================================
+Tested on:  Proxmox VE 9.x (Debian Trixie), 3x mini-PCs, 1x eth + Wi-Fi
+Prereq:     Working 3-node cluster on vmbr0 (10.10.10.0/24), Wi-Fi internet
+Goal:       Separate VM traffic to SDN VNet (10.10.20.0/24) with VXLAN overlay,
+            dnsmasq DHCP+DNS on pve1, NAT via Wi-Fi
+================================================================================
+
+ARCHITECTURE OVERVIEW
+================================================================================
+
+  Network Segments:
+    vmbr0  10.10.10.0/24  — cluster only (corosync, API, migration)
+    vmnet  10.10.20.0/24  — VMs only (Proxmox SDN VXLAN overlay, MTU 1450)
+
+  DHCP Pool:
+    Dynamic  10.10.20.100-200
+    Static   10.10.20.10-99   — reserved for DHCP reservations
+
+  DNS:
+    dnsmasq on pve1 only (DHCP + DNS + local zone lab.internal)
+
+  Addressing:
+    pve1   10.10.10.2  (vmbr0)   10.10.20.1  (vmnet)  — NAT, DHCP, DNS
+    pve2   10.10.10.3  (vmbr0)   10.10.20.2  (vmnet)
+    pve3   10.10.10.4  (vmbr0)   10.10.20.3  (vmnet)
+    VMs    —                     10.10.20.x  (vmnet)   — DHCP or static
+    Wi-Fi  192.168.31.x (wlp2s0) — internet via router 192.168.31.1
+
+  MTU:
+    vmbr0        1500 (standard, no overlay)
+    vxlan_vmnet  1450 (VXLAN overhead = 50 bytes)
+    vmnet        1450 (inherits from VXLAN underlay)
+    VMs          1450 (via DHCP option)
+
+  SDN Architecture:
+    Zone:    vmzone (type: vxlan, peers: 10.10.10.2,10.10.10.3,10.10.10.4)
+    VNet:    vmnet (zone: vmzone, tag: 20)
+    Subnet:  10.10.20.0/24 (gateway: 10.10.20.1)
+    SDN generates /etc/network/interfaces.d/sdn on each node automatically.
+    Node IPs on vmnet are assigned via merge-stanza in /etc/network/interfaces.
+
+  DNS Architecture:
+    Single dnsmasq on pve1 handles everything:
+      - DHCP leases → automatic DNS for VM hostnames
+      - Static records → address= lines for nodes
+      - Upstream forwarding → 8.8.8.8, 1.1.1.1
+    Domain: lab.internal (NOT .local — avoids mDNS conflicts)
+    All nodes and VMs point to 10.10.20.1 as primary DNS.
+    Fallback 8.8.8.8 handles internet DNS if pve1 is down.
+
+  Firewall:
+    iptables-legacy backend (not nftables)
+    Proxmox Firewall: DISABLED (do not enable — conflicts with manual rules)
+    Rules persisted via /etc/iptables/rules.v4 + iptables-restore at boot
+
+  NOTE: vmbr0 IPs (.2/.3/.4) are NOT changed — corosync depends on them.
+        10.10.10.1 is intentionally free (can be used as HA VIP later).
+
+
+================================================================================
+STEP 0: BACKUP AND VERIFY CURRENT STATE
+================================================================================
+
+# Run on all nodes — save current config
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  echo "=== $node ==="
+  ssh root@$node 'cp /etc/network/interfaces /etc/network/interfaces.bak'
+  ssh root@$node 'cat /etc/network/interfaces'
+  echo
+done
+
+# Verify cluster is healthy
+pvecm status
+pvecm nodes
+
+# Note current VM config (for rollback)
+qm list
+pvesh get /cluster/resources --type vm --output-format json-pretty | grep -E '"vmid"|"node"|"name"'
+
+
+================================================================================
+STEP 1: SYSCTL — IP FORWARDING (pve1 only)
+================================================================================
+
+# CRITICAL: Without this, NAT rules exist but traffic won't flow.
+# Must be persistent — survives reboot.
+
+cat > /etc/sysctl.d/99-forwarding.conf << 'EOF'
+net.ipv4.ip_forward=1
+net.ipv4.tcp_mtu_probing=1
+EOF
+
+sysctl -p /etc/sysctl.d/99-forwarding.conf
+
+# Verify
+cat /proc/sys/net/ipv4/ip_forward        # must be 1
+cat /proc/sys/net/ipv4/tcp_mtu_probing   # must be 1
+
+
+================================================================================
+STEP 2: CONFIGURE /etc/network/interfaces ON ALL NODES
+================================================================================
+
+# Each node has:
+#   - vmbr0 for cluster (management)
+#   - wlp2s0 for Wi-Fi internet
+#   - merge-stanza for vmnet IP (SDN generates the bridge itself)
+#
+# The merge-stanza (iface vmnet inet static) combines with SDN-generated
+# stanza in /etc/network/interfaces.d/sdn. ifupdown2 merges them at reload.
+# SDN controls the bridge config, you control the IP assignment.
+
+# ---- pve1 ----
+cat > /etc/network/interfaces << 'ENDCONF'
+auto lo
+iface lo inet loopback
+iface nic0 inet manual
+
+# Management bridge — cluster only (corosync, API, migration)
+auto vmbr0
+iface vmbr0 inet static
+        address 10.10.10.2/24
+        bridge-ports nic0
+        bridge-stp off
+        bridge-fd 0
+
+iface nic1 inet manual
+
+# Wi-Fi — internet uplink
+auto wlp2s0
+iface wlp2s0 inet dhcp
+    wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf
+    dns-nameservers 8.8.8.8 1.1.1.1
+    post-up ip route del default 2>/dev/null; ip route add default via 192.168.31.1 dev wlp2s0
+
+# VM network — merge with SDN-generated vmnet stanza
+iface vmnet inet static
+    address 10.10.20.1/24
+
+source /etc/network/interfaces.d/*
+ENDCONF
+
+# ---- pve2 ----
+ssh root@10.10.10.3 'cat > /etc/network/interfaces << "ENDCONF"
+auto lo
+iface lo inet loopback
+iface nic0 inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+        address 10.10.10.3/24
+        bridge-ports nic0
+        bridge-stp off
+        bridge-fd 0
+
+iface nic1 inet manual
+
+auto wlp2s0
+iface wlp2s0 inet dhcp
+    wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf
+    dns-nameservers 8.8.8.8 1.1.1.1
+    post-up ip route del default 2>/dev/null; ip route add default via 192.168.31.1 dev wlp2s0
+
+# VM network — merge with SDN-generated vmnet stanza
+iface vmnet inet static
+    address 10.10.20.2/24
+
+source /etc/network/interfaces.d/*
+ENDCONF'
+
+# ---- pve3 ----
+ssh root@10.10.10.4 'cat > /etc/network/interfaces << "ENDCONF"
+auto lo
+iface lo inet loopback
+iface nic0 inet manual
+
+auto vmbr0
+iface vmbr0 inet static
+        address 10.10.10.4/24
+        bridge-ports nic0
+        bridge-stp off
+        bridge-fd 0
+
+iface nic1 inet manual
+
+auto wlp2s0
+iface wlp2s0 inet dhcp
+    wpa-conf /etc/wpa_supplicant/wpa_supplicant.conf
+    dns-nameservers 8.8.8.8 1.1.1.1
+    post-up ip route del default 2>/dev/null; ip route add default via 192.168.31.1 dev wlp2s0
+
+# VM network — merge with SDN-generated vmnet stanza
+iface vmnet inet static
+    address 10.10.20.3/24
+
+source /etc/network/interfaces.d/*
+ENDCONF'
+
+
+================================================================================
+STEP 3: CREATE PROXMOX SDN ZONE + VNET
+================================================================================
+
+# SDN replaces manual VXLAN configuration. It creates the VXLAN tunnel
+# and bridge (vmnet) automatically on all cluster nodes.
+# Adding a new node later: update peers list, pvesh set /cluster/sdn — done.
+
+# Install ifupdown2 on all nodes (required for SDN)
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  ssh root@$node 'apt install -y ifupdown2'
+done
+
+# Create VXLAN zone
+pvesh create /cluster/sdn/zones \
+  --zone vmzone \
+  --type vxlan \
+  --peers "10.10.10.2,10.10.10.3,10.10.10.4"
+
+# Create VNet (bridge "vmnet" will appear on all nodes)
+pvesh create /cluster/sdn/vnets \
+  --vnet vmnet \
+  --zone vmzone \
+  --tag 20
+
+# Create Subnet
+pvesh create /cluster/sdn/vnets/vmnet/subnets \
+  --subnet "10.10.20.0/24" \
+  --type subnet \
+  --gateway "10.10.20.1"
+
+# Apply SDN configuration to all nodes
+pvesh set /cluster/sdn
+
+# NOTE: ifreload -a may fail due to wpa_supplicant. This is expected.
+# If vmnet doesn't come up automatically, bring it up manually:
+ifup vxlan_vmnet; ifup vmnet
+ssh root@10.10.10.3 'ifup vxlan_vmnet; ifup vmnet'
+ssh root@10.10.10.4 'ifup vxlan_vmnet; ifup vmnet'
+
+# Verify SDN config
+pvesh get /cluster/sdn/zones --output-format json-pretty
+pvesh get /cluster/sdn/vnets --output-format json-pretty
+
+# Verify SDN-generated interfaces config
+cat /etc/network/interfaces.d/sdn
+# Expected:
+#   auto vmnet
+#   iface vmnet
+#       bridge_ports vxlan_vmnet
+#       bridge_stp off
+#       bridge_fd 0
+#       mtu 1450
+#   auto vxlan_vmnet
+#   iface vxlan_vmnet
+#       vxlan-id 20
+#       vxlan_remoteip 10.10.10.3
+#       vxlan_remoteip 10.10.10.4
+#       mtu 1450
+
+# Verify vmnet is UP with correct IP and MTU on all nodes
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  echo "=== $node ==="
+  ssh root@$node 'ip link show vmnet | grep -E "state|mtu"; ip addr show vmnet | grep inet'
+done
+# Expected: mtu 1450, state UP, correct 10.10.20.x/24 address
+
+# Verify VXLAN mesh connectivity
+ping -c 1 10.10.20.2
+ping -c 1 10.10.20.3
+ssh root@10.10.10.3 'ping -c 1 10.10.20.1'
+ssh root@10.10.10.4 'ping -c 1 10.10.20.1'
+
+
+================================================================================
+STEP 4: INSTALL AND CONFIGURE dnsmasq ON pve1 (DHCP + DNS)
+================================================================================
+
+apt install -y dnsmasq
+
+# Stop default instance while configuring
+systemctl stop dnsmasq
+
+# Disable dnsmasq from interfering with host DNS
+echo 'DNSMASQ_EXCEPT="lo"' >> /etc/default/dnsmasq
+
+# Create config
+cat > /etc/dnsmasq.d/homelab.conf << 'EOF'
+# =============================================
+# dnsmasq config — pve1 (DHCP + DNS for VM network)
+# =============================================
+
+# Listen only on VM bridge (no DHCP/DNS on management or Wi-Fi)
+interface=vmnet
+bind-interfaces
+
+# Do not read /etc/resolv.conf
+no-resolv
+
+# Upstream DNS
+server=8.8.8.8
+server=1.1.1.1
+
+# ---- DHCP ----
+dhcp-range=10.10.20.100,10.10.20.200,255.255.255.0,12h
+dhcp-option=option:router,10.10.20.1
+dhcp-option=option:dns-server,10.10.20.1
+dhcp-option=option:domain-search,lab.internal
+# VXLAN MTU — must match overlay MTU
+dhcp-option=option:mtu,1450
+
+dhcp-leasefile=/var/lib/misc/dnsmasq.leases
+
+# ---- DNS ----
+# NOTE: expand-hosts is NOT used — it conflicts with /etc/hosts
+# (which maps pve* to management IPs for corosync).
+# All DNS records are explicit via address= lines below.
+domain=lab.internal
+local=/lab.internal/
+
+# Cluster nodes — VM-side addresses (reachable from VM network)
+address=/pve1.lab.internal/10.10.20.1
+address=/pve2.lab.internal/10.10.20.2
+address=/pve3.lab.internal/10.10.20.3
+
+# Static DHCP reservations (add as needed)
+# dhcp-host=MAC,hostname,IP
+# dhcp-host=BC:24:11:AA:BB:CC,k8s-master-1,10.10.20.10
+
+# ---- Logging (disable after testing) ----
+log-queries
+log-dhcp
+log-facility=/var/log/dnsmasq.log
+EOF
+
+# Validate config
+dnsmasq --test
+# Expected: "dnsmasq: syntax check OK."
+
+# Start
+systemctl enable --now dnsmasq
+systemctl status dnsmasq --no-pager
+
+# Verify it listens on vmnet only
+ss -ulnp | grep ':53'
+ss -ulnp | grep ':67'
+# Should show 10.10.20.1:53 and 10.10.20.1:67
+
+# Test DNS resolution
+dig @10.10.20.1 pve1.lab.internal +short
+# Expected: 10.10.20.1
+
+dig @10.10.20.1 google.com +short
+# Expected: Google IP addresses
+
+
+================================================================================
+STEP 5: IPTABLES — NAT + MSS CLAMPING + VXLAN (pve1 only)
+================================================================================
+
+# Rules are idempotent — iptables-restore replaces all rules each time.
+# FORWARD policy is DROP — only explicitly allowed traffic passes.
+
+cat > /etc/iptables/rules.v4 << 'EOF'
+*mangle
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+# MSS clamping — VXLAN MTU 1450, MSS = 1450 - 40 = 1410
+# Without this, HTTPS/TLS hangs because large TCP segments exceed VXLAN MTU.
+# PMTUD blackhole: ICMP "frag needed" may be dropped by Wi-Fi router or ISP.
+-A FORWARD -i vmnet -o wlp2s0 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1410
+-A FORWARD -i wlp2s0 -o vmnet -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1410
+COMMIT
+
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+# VXLAN between cluster nodes
+-A INPUT -s 10.10.10.0/24 -p udp -m udp --dport 4789 -j ACCEPT
+# VM internet access via NAT
+-A FORWARD -i vmnet -o wlp2s0 -j ACCEPT
+-A FORWARD -i wlp2s0 -o vmnet -m state --state RELATED,ESTABLISHED -j ACCEPT
+COMMIT
+
+*nat
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+# NAT for VM subnet
+-A POSTROUTING -s 10.10.20.0/24 -o wlp2s0 -j MASQUERADE
+COMMIT
+EOF
+
+# Install persistence package
+apt install -y iptables-persistent
+
+# Apply rules
+iptables-restore < /etc/iptables/rules.v4
+
+# Verify
+iptables -t nat -L POSTROUTING -v -n
+iptables -L FORWARD -v -n
+iptables -t mangle -L FORWARD -v -n
+
+# Verify iptables backend (should be legacy, not nf_tables)
+iptables -V
+# Expected: iptables v1.8.x (legacy)
+
+# NOTE on Proxmox Firewall:
+# PVE Firewall is DISABLED. Do not enable it (Datacenter → Firewall)
+# as it generates its own iptables chains and conflicts with manual rules.
+# Check: pvesh get /cluster/firewall/options
+
+
+================================================================================
+STEP 6: CONFIGURE NODE DNS (dhclient.conf on all nodes)
+================================================================================
+
+# PROBLEM: Wi-Fi uses DHCP, and dhclient overwrites /etc/resolv.conf with
+# the router's DNS (192.168.31.1), ignoring dns-nameservers from interfaces.
+# FIX: Use dhclient.conf "supersede" to force dnsmasq as primary DNS.
+# All nodes point to pve1 (10.10.20.1) — the only dnsmasq instance.
+
+# ---- pve1 ----
+cat > /etc/dhcp/dhclient.conf << 'EOF'
+supersede domain-name-servers 10.10.20.1, 8.8.8.8;
+supersede domain-search "lab.internal";
+EOF
+
+pkill wpa_supplicant; sleep 2; ifdown wlp2s0 && ifup wlp2s0
+
+# Verify
+cat /etc/resolv.conf
+# Expected: nameserver 10.10.20.1 / nameserver 8.8.8.8 / search lab.internal
+
+# ---- pve2 ----
+ssh root@10.10.10.3 'cat > /etc/dhcp/dhclient.conf << EOF
+supersede domain-name-servers 10.10.20.1, 8.8.8.8;
+supersede domain-search "lab.internal";
+EOF
+pkill wpa_supplicant; sleep 2; ifdown wlp2s0 && ifup wlp2s0
+cat /etc/resolv.conf'
+
+# ---- pve3 ----
+ssh root@10.10.10.4 'cat > /etc/dhcp/dhclient.conf << EOF
+supersede domain-name-servers 10.10.20.1, 8.8.8.8;
+supersede domain-search "lab.internal";
+EOF
+pkill wpa_supplicant; sleep 2; ifdown wlp2s0 && ifup wlp2s0
+cat /etc/resolv.conf'
+
+# ---- Verify DNS on all nodes ----
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  echo "=== $node ==="
+  ssh root@$node 'cat /etc/resolv.conf'
+  echo
+done
+
+
+================================================================================
+STEP 7: VERIFY /etc/hosts ON ALL NODES
+================================================================================
+
+# /etc/hosts maps pve* to management IPs for corosync.
+# Do NOT add lab.internal entries here — dnsmasq handles DNS.
+# Do NOT use expand-hosts in dnsmasq — it pulls these entries
+# into the DNS zone and overrides address= lines.
+
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  echo "=== $node ==="
+  ssh root@$node 'cat /etc/hosts'
+  echo
+done
+
+# All nodes should have (hostnames may vary):
+#   10.10.10.2 pve1.lab pve1
+#   10.10.10.3 pve2.lab pve2
+#   10.10.10.4 pve3.lab pve3
+
+
+================================================================================
+STEP 8: SWITCH VMs TO vmnet
+================================================================================
+
+# Stop VMs first
+qm stop 101
+qm stop 102
+# ... stop all VMs
+
+# Switch network interface to vmnet and set DHCP
+# On pve1 (for VMs on this node):
+for vmid in 101 102 103 121 9000; do
+  qm set $vmid --net0 virtio,bridge=vmnet
+  echo "$vmid done"
+done
+
+# On pve2 (for VMs on that node):
+ssh root@10.10.10.3 'for vmid in 122 9002; do
+  qm set $vmid --net0 virtio,bridge=vmnet
+  echo "$vmid done"
+done'
+
+# On pve3:
+ssh root@10.10.10.4 'for vmid in 123 9003; do
+  qm set $vmid --net0 virtio,bridge=vmnet
+  echo "$vmid done"
+done'
+
+# NOTE: qm set only works on the node where the VM is registered.
+# Templates are also switched — new clones will inherit bridge=vmnet.
+
+# Start VMs
+qm start 101
+qm start 102
+# Wait ~15 seconds for DHCP lease
+
+# Check leases
+cat /var/lib/misc/dnsmasq.leases
+
+
+================================================================================
+STEP 9: REBOOT TEST — ALL NODES
+================================================================================
+
+# Reboot each node one at a time. After reboot, verify:
+#   - vmnet UP with MTU 1450 and correct IP
+#   - VXLAN mesh connectivity
+#   - resolv.conf correct
+#   - (pve1 only) dnsmasq active, iptables loaded, ip_forward=1
+
+# ---- pve3 (least critical, test first) ----
+ssh root@10.10.10.4 'reboot'
+# Wait ~60 seconds
+ssh root@10.10.10.4 '
+  ip link show vmnet | grep -E "state|mtu"
+  ip addr show vmnet | grep inet
+  cat /etc/resolv.conf
+  ping -c 1 10.10.20.1'
+
+# ---- pve2 ----
+ssh root@10.10.10.3 'reboot'
+# Wait ~60 seconds
+ssh root@10.10.10.3 '
+  ip link show vmnet | grep -E "state|mtu"
+  ip addr show vmnet | grep inet
+  cat /etc/resolv.conf
+  ping -c 1 10.10.20.1'
+
+# ---- pve1 (gateway — most critical) ----
+reboot
+# Wait ~60 seconds, SSH from laptop via Wi-Fi:
+ssh root@<pve1-wifi-ip> '
+  ip link show vmnet | grep -E "state|mtu"
+  ip addr show vmnet | grep inet
+  cat /proc/sys/net/ipv4/ip_forward
+  systemctl is-active dnsmasq
+  iptables -L FORWARD -n | head -5
+  iptables -t nat -L POSTROUTING -n | head -3
+  iptables -t mangle -L FORWARD -n | grep TCPMSS
+  dig @10.10.20.1 pve1.lab.internal +short
+  ping -c 1 10.10.20.2
+  ping -c 1 8.8.8.8'
+
+# Cluster still healthy?
+pvecm status
+pvecm nodes
+
+
+================================================================================
+STEP 10: VERIFY EVERYTHING
+================================================================================
+
+# ---- From pve1 ----
+# 1. Cluster
+pvecm status
+pvecm nodes
+
+# 2. SDN
+pvesh get /cluster/sdn/zones --output-format json-pretty
+pvesh get /cluster/sdn/vnets --output-format json-pretty
+
+# 3. VXLAN mesh
+ping -c 1 10.10.20.2
+ping -c 1 10.10.20.3
+
+# 4. DHCP leases
+cat /var/lib/misc/dnsmasq.leases
+
+# 5. DNS
+dig @10.10.20.1 pve1.lab.internal +short    # 10.10.20.1
+dig @10.10.20.1 pve2.lab.internal +short    # 10.10.20.2
+dig @10.10.20.1 google.com +short
+
+# ---- From inside VM ----
+ssh ubuntu@<VM_IP>
+
+# 6. IP, gateway, MTU
+ip addr show eth0
+ip route show
+# Expected: default via 10.10.20.1
+ip link show eth0 | grep mtu
+# Expected: mtu 1450
+
+# 7. DNS
+resolvectl status eth0
+# Expected: DNS Servers: 10.10.20.1, DNS Domain: lab.internal
+
+# 8. Resolution
+nslookup pve1.lab.internal
+nslookup google.com
+
+# 9. Internet — HTTP
+ping -c 3 8.8.8.8
+ping -c 3 google.com
+
+# 10. Internet — HTTPS (critical test for MTU/MSS fix)
+curl -4 -I --max-time 10 https://security.ubuntu.com/
+# Should return HTTP headers within seconds, NOT hang
+
+# 11. apt update (uses HTTPS, will hang without MTU/MSS fix)
+sudo apt update
+
+# 12. PMTUD verification
+ping -M do -s 1422 8.8.8.8 -c 2
+# Should pass (1422 + 28 = 1450 = VXLAN MTU)
+ping -M do -s 1423 8.8.8.8 -c 2
+# Should fail with "Frag needed" (exceeds MTU)
+
+
+================================================================================
+STEP 11: STATIC DHCP RESERVATIONS (recommended for important VMs)
+================================================================================
+
+# Instead of hardcoding IPs inside VMs, use dnsmasq DHCP reservations.
+# VMs keep DHCP but always get the same IP + DNS name.
+
+# Find VM MAC addresses:
+qm config 101 | grep net0
+# Look for: virtio=XX:XX:XX:XX:XX:XX,bridge=vmnet
+
+# Add reservations to dnsmasq config on pve1:
+vim /etc/dnsmasq.d/homelab.conf
+
+# --- ADD in DHCP section ---
+# dhcp-host=XX:XX:XX:XX:XX:XX,test-vm,10.10.20.10
+# dhcp-host=YY:YY:YY:YY:YY:YY,test-vm-2,10.10.20.11
+# --- END ---
+
+# --- ADD in DNS section ---
+# address=/test-vm.lab.internal/10.10.20.10
+# address=/test-vm-2.lab.internal/10.10.20.11
+# --- END ---
+
+# Reload dnsmasq
+systemctl restart dnsmasq
+
+# Force VMs to renew lease
+qm reboot 101
+qm reboot 102
+
+# Verify
+cat /var/lib/misc/dnsmasq.leases
+dig @10.10.20.1 test-vm.lab.internal +short
+
+
+================================================================================
+STEP 12: DISABLE dnsmasq LOGGING (after testing)
+================================================================================
+
+vim /etc/dnsmasq.d/homelab.conf
+# Comment out or remove:
+#   log-queries
+#   log-dhcp
+#   log-facility=/var/log/dnsmasq.log
+
+systemctl restart dnsmasq
+
+
+================================================================================
+ROLLBACK PROCEDURE
+================================================================================
+
+# 1. Switch VMs back to vmbr0 with old static IPs
+qm stop 101
+qm set 101 --net0 virtio,bridge=vmbr0
+qm set 101 --ipconfig0 ip=10.10.10.101/24,gw=10.10.10.2
+qm set 101 --nameserver 8.8.8.8
+qm start 101
+# Repeat for all VMs
+
+# 2. Remove SDN
+pvesh delete /cluster/sdn/vnets/vmnet/subnets/10.10.20.0-24
+pvesh delete /cluster/sdn/vnets/vmnet
+pvesh delete /cluster/sdn/zones/vmzone
+pvesh set /cluster/sdn
+
+# 3. Restore old NAT rules
+iptables -t nat -D POSTROUTING -s 10.10.20.0/24 -o wlp2s0 -j MASQUERADE 2>/dev/null
+iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o wlp2s0 -j MASQUERADE
+iptables-save > /etc/iptables/rules.v4
+
+# 4. Restore interfaces from backup on each node
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  ssh root@$node 'cp /etc/network/interfaces.bak /etc/network/interfaces'
+  ssh root@$node 'reboot'
+done
+
+# 5. Restore dhclient.conf on all nodes
+for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+  ssh root@$node 'rm -f /etc/dhcp/dhclient.conf; pkill wpa_supplicant; sleep 1; ifdown wlp2s0; ifup wlp2s0'
+done
+
+# 6. Stop and disable dnsmasq
+systemctl disable --now dnsmasq
+
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+# SDN vmnet not coming up after reboot
+  ip link show vmnet                             # is it UP?
+  ip link show vxlan_vmnet                       # VXLAN interface?
+  cat /etc/network/interfaces.d/sdn              # SDN config present?
+  ifup vxlan_vmnet; ifup vmnet                   # manual bring-up
+  # ifreload -a may fail due to wpa_supplicant — this is a known issue
+  # Workaround: pkill wpa_supplicant; sleep 2; ifreload -a
+
+# VXLAN not working between nodes
+  ip link show vxlan_vmnet                       # is it UP?
+  bridge fdb show dev vxlan_vmnet                # FDB entries present?
+  tcpdump -i vmbr0 udp port 4789 -c 5           # VXLAN packets flowing?
+  iptables -L INPUT -n | grep 4789              # not blocked?
+
+# VM not getting DHCP lease
+  journalctl -u dnsmasq --no-pager -n 20        # dnsmasq errors?
+  ss -ulnp | grep ':67'                         # listening on vmnet?
+  tcpdump -i vmnet port 67 or port 68 -c 10     # DHCP traffic visible?
+  qm config <vmid> | grep net                   # bridge=vmnet?
+
+# VM has IP but no internet
+  # From VM:
+  ip route                                       # default via 10.10.20.1?
+  ping 10.10.20.1                                # gateway reachable?
+  ping 8.8.8.8                                   # NAT working?
+  ping google.com                                # DNS working?
+  # From pve1:
+  iptables -t nat -L POSTROUTING -v -n           # MASQUERADE rule exists?
+  iptables -L FORWARD -v -n                      # FORWARD rules exist?
+  cat /proc/sys/net/ipv4/ip_forward              # returns 1?
+
+# HTTPS hangs but HTTP works (MTU/MSS issue)
+  # From VM:
+  ip link show eth0 | grep mtu                   # should be 1450, not 1500
+  ping -M do -s 1422 8.8.8.8                     # should pass
+  ping -M do -s 1472 8.8.8.8                     # should fail
+  # From pve1:
+  iptables -t mangle -L FORWARD -v -n | grep TCPMSS  # MSS clamp rules?
+
+# Node cannot resolve VM hostnames
+  cat /etc/resolv.conf                           # 10.10.20.1 first?
+  cat /etc/dhcp/dhclient.conf                    # supersede lines?
+  dig @10.10.20.1 test-vm.lab.internal +short    # dnsmasq resolves?
+  # If resolv.conf shows 192.168.31.1 — dhclient.conf not applied
+  pkill wpa_supplicant; sleep 1; ifdown wlp2s0; ifup wlp2s0
+
+# iptables rules missing after reboot
+  cat /etc/iptables/rules.v4                     # file exists?
+  iptables -V                                    # should say (legacy)
+  iptables-restore < /etc/iptables/rules.v4      # re-apply manually
+  dpkg -l | grep iptables-persistent             # package installed?
+
+# DNS not resolving
+  dig @10.10.20.1 google.com                     # upstream forwarding?
+  dig @10.10.20.1 pve1.lab.internal              # local records?
+  systemctl status dnsmasq                        # running?
+  tail -30 /var/log/dnsmasq.log                  # errors? (if logging on)
+
+# Cluster issues
+  pvecm status                                   # quorate?
+  pvecm nodes                                    # all nodes online?
+  journalctl -u corosync --no-pager -n 30        # corosync errors?
+  # NOTE: vmbr0 must NOT be modified for cluster to work
+
+# Wi-Fi broke after changes
+  iwconfig wlp2s0                                # associated?
+  ip route | head -1                             # default via 192.168.31.1?
+  wpa_cli status                                 # connected?
+  pkill wpa_supplicant; sleep 2; ifdown wlp2s0 && ifup wlp2s0
+
+
+================================================================================
+NOTES
+================================================================================
+
+- vmbr0 is NOT modified. Cluster traffic is untouched.
+  Node IPs: pve1=10.10.10.2, pve2=10.10.10.3, pve3=10.10.10.4
+- 10.10.10.1 is intentionally unused — reserve for future HA VIP.
+
+- SDN manages VXLAN mesh automatically via vmzone + vmnet.
+  VXLAN ID 20, UDP 4789 (IANA standard).
+  Config stored in /etc/pve/sdn/ (cluster-wide pmxcfs).
+  Generated per-node config: /etc/network/interfaces.d/sdn
+
+- Node IPs on vmnet use merge-stanza in /etc/network/interfaces.
+  SDN does not manage host IPs on the bridge — only the bridge itself.
+  ifupdown2 merges both stanzas at reload/boot.
+
+- MTU 1450 is enforced in THREE places:
+    1. SDN-generated vmnet + vxlan_vmnet interfaces (mtu 1450)
+    2. DHCP option (dhcp-option=option:mtu,1450 in dnsmasq)
+    3. MSS clamping (iptables mangle TCPMSS --set-mss 1410 on pve1)
+
+- Domain is lab.internal (NOT .local — avoids mDNS/Avahi conflicts).
+
+- DNS: expand-hosts is NOT used. /etc/hosts maps pve* to management IPs
+  (10.10.10.x) for corosync, and expand-hosts would inject those into
+  the DNS zone, overriding the VM-side address= records.
+  All DNS records are explicit via address= lines in dnsmasq config.
+
+- Firewall: iptables-legacy backend. Proxmox Firewall is disabled.
+  Do not enable PVE Firewall — it conflicts with manual iptables rules.
+  Rules are idempotent via /etc/iptables/rules.v4 + iptables-restore.
+  FORWARD policy is DROP — only vmnet↔wlp2s0 traffic is allowed.
+
+- sysctl: ip_forward and tcp_mtu_probing are persisted in
+  /etc/sysctl.d/99-forwarding.conf.
+
+- DHCP lease time is 12h. If pve1 is down <12h, VMs keep IPs.
+
+- dhclient on wlp2s0 overwrites /etc/resolv.conf with router DNS.
+  /etc/dhcp/dhclient.conf with "supersede" forces dnsmasq as primary.
+
+- Wi-Fi + ifreload -a: wpa_supplicant may fail during hot reload.
+  Workaround: pkill wpa_supplicant; sleep 2; ifreload -a
+  Or reboot the node.
+
+- Cloud-init VMs with ipconfig0=ip=dhcp will auto-configure on reboot.
+
+- When adding new VM DNS records with static IPs, add both:
+    dhcp-host=MAC,hostname,IP   (DHCP reservation)
+    address=/hostname.lab.internal/IP  (static DNS)
+
+
+================================================================================
+FUTURE: ADDING A 4TH NODE
+================================================================================
+
+With SDN, adding a new node is simple:
+  1. Join node to cluster (standard pvecm add)
+  2. Update SDN zone peers:
+       pvesh set /cluster/sdn/zones/vmzone \
+         --peers "10.10.10.2,10.10.10.3,10.10.10.4,10.10.10.5"
+       pvesh set /cluster/sdn
+  3. Add merge-stanza in new node's /etc/network/interfaces:
+       iface vmnet inet static
+           address 10.10.20.4/24
+  4. Add dhclient.conf on new node
+  5. Add DNS record: address=/pve4.lab.internal/10.10.20.4
+
+No changes needed on existing nodes (SDN updates mesh automatically).
+
+
+================================================================================
+FUTURE: UPGRADING TO 2-PORT HARDWARE
+================================================================================
+
+When you have 2x 2.5GbE per node:
+  1. Change SDN zone type from vxlan to simple (direct L2)
+     Or remove SDN and use standard vmbr1 with bridge-ports eno2
+  2. Remove MTU 1450 — no VXLAN overhead, MTU returns to 1500
+  3. Remove MSS clamping rules from iptables
+  4. Remove dhcp-option=option:mtu,1450 from dnsmasq
+  5. Connect all eno2 to same switch
+  Everything else (dnsmasq, NAT, VM config, DNS records) stays identical.
+
+
+================================================================================
+CONFIG FILE LOCATIONS
+================================================================================
+
+  /etc/network/interfaces            — per-node: vmbr0, wlp2s0, vmnet merge-stanza
+  /etc/network/interfaces.d/sdn      — SDN-generated: vmnet bridge + vxlan_vmnet
+  /etc/pve/sdn/zones.cfg             — cluster-wide: SDN zone config
+  /etc/pve/sdn/vnets.cfg             — cluster-wide: SDN vnet config
+  /etc/pve/sdn/subnets.cfg           — cluster-wide: SDN subnet config
+  /etc/dnsmasq.d/homelab.conf        — pve1 only: DHCP + DNS
+  /etc/iptables/rules.v4             — pve1 only: NAT + MSS + firewall
+  /etc/sysctl.d/99-forwarding.conf   — pve1 only: ip_forward + mtu_probing
+  /etc/dhcp/dhclient.conf            — all nodes: DNS override for Wi-Fi
+  /etc/hosts                         — all nodes: management IPs for corosync
+  /var/lib/misc/dnsmasq.leases       — pve1 only: DHCP lease database
