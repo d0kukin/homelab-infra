@@ -1,0 +1,233 @@
+================================================================================
+RUNBOOK: Доступ с ноутбука к VM-сети (маршрут + split-DNS)
+================================================================================
+Tested on:  Proxmox VE 9.x (Debian Trixie), 3x mini-PCs, Windows 11 + WSL2
+Prereq:     Working SDN VXLAN (see infra-network-sdn-vxlan-nat runbook)
+            Working HA VIP (see proxmox-ha-vip runbook)
+Goal:       Прямой доступ с ноутбука к VM-сети 10.10.20.0/24 и резолвинг
+            *.lab.internal — без VPN, через Wi-Fi 192.168.31.0/24.
+================================================================================
+
+АРХИТЕКТУРА
+================================================================================
+
+  Ноутбук (Windows 11 + WSL2)
+      IP:  192.168.31.100  (Wi-Fi DHCP)
+      DNS: NRPT-правило: *.lab.internal → 10.10.20.1
+
+      ↓  route: 10.10.20.0/24 via <VIP>
+
+  Wi-Fi 192.168.31.0/24 (Xiaomi роутер)
+
+      ↓  VIP плавает между нодами (keepalived)
+
+  Нода с VIP (wlp2s0)
+      iptables FORWARD: 192.168.31.0/24 → vmnet (на ВСЕХ трёх нодах)
+      ip_forward=1 (на ВСЕХ трёх нодах)
+
+      ↓
+
+  vmnet 10.10.20.0/24
+      10.10.20.1  pve1 (dnsmasq — DHCP + DNS для lab.internal)
+      10.10.20.2  pve2
+      10.10.20.3  pve3
+      10.10.20.x  VMs
+
+  ВАЖНО — асимметричный роутинг:
+    Запрос:  ноут → нода-с-VIP → VM
+    Ответ:   VM → pve1 (default gw) → ноут
+    Это нормально. pve1 пропускает ответы через stateless ACCEPT vmnet→wlp2s0.
+
+  ВАЖНО — VIP плавает с nopreempt:
+    iptables и ip_forward должны быть на ВСЕХ трёх нодах.
+    Иначе при failover доступ теряется.
+
+
+================================================================================
+ЧАСТЬ 1: PROXMOX — iptables + ip_forward на всех нодах
+================================================================================
+
+  Выполнять с pve1 (или любой ноды с SSH-доступом к кластеру).
+
+  pve1 (NAT-шлюз) — добавить только FORWARD-правило:
+  -------------------------------------------------------
+
+  # Проверить что правило ещё не добавлено
+  grep -q "192.168.31.0" /etc/iptables/rules.v4 && echo "already exists"
+
+  # Если не добавлено — добавить в *filter секцию
+  sed -i '/# VM internet access via NAT/a -A FORWARD -s 192.168.31.0\/24 -i wlp2s0 -o vmnet -j ACCEPT' \
+    /etc/iptables/rules.v4
+  iptables-restore < /etc/iptables/rules.v4
+
+  # Проверить
+  iptables -L FORWARD -v -n | grep 192.168
+
+  pve2, pve3 — ip_forward + минимальный iptables:
+  -------------------------------------------------------
+
+  # ip_forward на pve2/pve3 не был нужен раньше (они не NAT-шлюзы),
+  # но при VIP на этих нодах необходим для форвардинга пакетов в vmnet.
+
+  for node in 10.10.10.3 10.10.10.4; do
+    echo "=== $node ==="
+    ssh root@$node '
+      # ip_forward — persistent
+      echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-forwarding.conf
+      sysctl -p /etc/sysctl.d/99-forwarding.conf
+
+      # iptables — минимальный набор для VIP-форвардинга
+      # NOTE: NAT (MASQUERADE) не добавляется — только pve1 является шлюзом.
+      #       VMs используют 10.10.20.1 (pve1) как default gateway.
+      mkdir -p /etc/iptables
+      cat > /etc/iptables/rules.v4 << RULES
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+# VXLAN between cluster nodes
+-A INPUT -s 10.10.10.0/24 -p udp -m udp --dport 4789 -j ACCEPT
+# VM internet access via NAT
+-A FORWARD -s 192.168.31.0/24 -i wlp2s0 -o vmnet -j ACCEPT
+-A FORWARD -i vmnet -o wlp2s0 -j ACCEPT
+-A FORWARD -i wlp2s0 -o vmnet -m state --state RELATED,ESTABLISHED -j ACCEPT
+COMMIT
+RULES
+
+      apt install -y iptables-persistent -qq
+      iptables-restore < /etc/iptables/rules.v4
+      echo "ip_forward: $(cat /proc/sys/net/ipv4/ip_forward)"
+      iptables -L FORWARD -n | grep -E "policy|192.168"
+    '
+  done
+
+  Проверить состояние всех нод:
+  -------------------------------------------------------
+
+  for node in 10.10.10.2 10.10.10.3 10.10.10.4; do
+    echo "=== $node ==="
+    ssh root@$node '
+      echo "ip_forward: $(cat /proc/sys/net/ipv4/ip_forward)"
+      echo "VIP: $(ip addr show wlp2s0 | grep keepalived || echo none)"
+      iptables -L FORWARD -n | grep "192.168" || echo "FORWARD rule missing!"
+    '
+  done
+
+
+================================================================================
+ЧАСТЬ 2: WINDOWS — статический маршрут
+================================================================================
+
+  Выполнять в PowerShell от администратора.
+
+  Добавить persistent маршрут к VM-сети через VIP:
+
+    route add 10.10.20.0 mask 255.255.255.0 <VIP> -p
+
+  Проверить:
+
+    route print | findstr "10.10.20"
+    ping 10.10.20.1
+    # Ожидаемо: ответ с TTL=64, время ~5мс
+
+  ВНИМАНИЕ — корпоративный VPN:
+    Если в route print видно две строки для 10.10.20.0 — одна от VPN,
+    одна от Wi-Fi — побеждает та у которой меньше метрика (Interface Metric).
+    При подключённом Check Point VPN маршрут через VPN имеет меньшую метрику
+    и может перекрыть homelab-маршрут.
+    Это нормально — при включённом рабочем VPN лаба недоступна.
+
+  Удалить маршрут (если нужно):
+
+    route delete 10.10.20.0
+
+
+================================================================================
+ЧАСТЬ 3: WINDOWS — split-DNS через NRPT
+================================================================================
+
+  Выполнять в PowerShell от администратора.
+
+  NRPT (Name Resolution Policy Table) — нативный Windows-механизм split-DNS.
+  Работает поверх настроек адаптеров, не конфликтует с корпоративным VPN.
+  Только зона lab.internal идёт через dnsmasq на 10.10.20.1.
+
+  Добавить правило:
+
+    Add-DnsClientNrptRule -Namespace ".lab.internal" -NameServers "10.10.20.1"
+    Clear-DnsClientCache
+
+  Проверить:
+
+    Resolve-DnsName pve1.lab.internal
+    # Ожидаемо: IPAddress = 10.10.20.1
+
+    Resolve-DnsName google.com
+    # Ожидаемо: резолвится через штатный DNS (не через 10.10.20.1)
+
+  Проверить из WSL:
+
+    ping pve1.lab.internal
+    # Ожидаемо: PING pve1.lab.internal (10.10.20.1)
+
+    nslookup pve1.lab.internal
+    # NOTE: nslookup может показать NXDOMAIN после ответа —
+    #       это артефакт PTR-запроса, не ошибка.
+    #       Работоспособность подтверждается через ping.
+
+  Посмотреть все NRPT-правила:
+
+    Get-DnsClientNrptRule
+
+  Удалить правило (если нужно):
+
+    Get-DnsClientNrptRule | Where-Object {$_.Namespace -eq ".lab.internal"} |
+      Remove-DnsClientNrptRule -Force
+
+
+================================================================================
+ПОЧЕМУ ПРАВИЛА НУЖНЫ НА ВСЕХ ТРЁХ НОДАХ (архитектурная заметка)
+================================================================================
+
+  Изначально iptables и ip_forward были настроены только на pve1, т.к. только
+  она выступала NAT-шлюзом для VM-трафика в интернет.
+
+  После добавления HA VIP (keepalived) ситуация изменилась:
+    - VIP может плавать на pve2/pve3 при failover pve1
+    - nopreempt означает что VIP не возвращается автоматически
+    - пакеты с ноута идут через ноду с VIP, а не обязательно через pve1
+    - без ip_forward=1 нода с VIP не форвардит пакеты в vmnet
+
+  NAT (MASQUERADE) остаётся только на pve1 — VM-трафик всегда идёт через
+  10.10.20.1 как default gateway, это не меняется.
+
+
+================================================================================
+ДОБАВЛЕНИЕ НОВОГО VM — DNS-запись
+================================================================================
+
+  После запуска VM с DHCP-резервацией в dnsmasq на pve1:
+
+    # /etc/dnsmasq.d/homelab.conf — добавить
+    dhcp-host=XX:XX:XX:XX:XX:XX,my-service,10.10.20.10,infinite
+    address=/my-service.lab.internal/10.10.20.10
+
+    systemctl reload dnsmasq
+
+  С ноутбука сразу доступно:
+
+    ping my-service.lab.internal        # Windows
+    curl http://my-service.lab.internal:3000   # или любой порт сервиса
+
+
+================================================================================
+КОНФИГ ФАЙЛЫ
+================================================================================
+
+  Proxmox (все ноды):
+    /etc/iptables/rules.v4             — FORWARD правила
+    /etc/sysctl.d/99-forwarding.conf   — ip_forward=1
+
+  Windows (ноутбук):
+    Маршрут:  route print | findstr "10.10.20"  (persistent в реестре)
+    NRPT:     Get-DnsClientNrptRule
