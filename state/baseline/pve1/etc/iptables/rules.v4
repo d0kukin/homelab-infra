@@ -16,6 +16,7 @@ COMMIT
 # VXLAN between cluster nodes
 -A INPUT -s 10.10.10.0/24 -p udp -m udp --dport 4789 -j ACCEPT
 # VM internet access via NAT
+-A FORWARD -s 192.168.31.0/24 -i wlp2s0 -o vmnet -j ACCEPT
 -A FORWARD -i vmnet -o wlp2s0 -j ACCEPT
 -A FORWARD -i wlp2s0 -o vmnet -m state --state RELATED,ESTABLISHED -j ACCEPT
 COMMIT

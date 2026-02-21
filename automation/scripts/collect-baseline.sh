@@ -2,16 +2,13 @@
 # automation/scripts/collect-baseline.sh
 # Snapshot live node configs into state/baseline/ (mirrors real fs paths)
 set -euo pipefail
-
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BASELINE="$REPO_ROOT/state/baseline"
-
 declare -A NODES=(
   [pve1]=10.10.10.2
   [pve2]=10.10.10.3
   [pve3]=10.10.10.4
 )
-
 echo "=== Collecting per-node configs ==="
 for name in "${!NODES[@]}"; do
   ip="${NODES[$name]}"
@@ -47,13 +44,24 @@ for name in "${!NODES[@]}"; do
   ssh root@"$ip" 'cat /usr/local/sbin/chk_pve_vip.sh 2>/dev/null || true' \
     > "$dir/usr/local/sbin/chk_pve_vip.sh"
 
+  # iptables — теперь на всех нодах (pve2/pve3 нужны для VIP-форвардинга)
+  mkdir -p "$dir/etc/iptables"
+  ssh root@"$ip" 'cat /etc/iptables/rules.v4 2>/dev/null || true' \
+    > "$dir/etc/iptables/rules.v4"
+
+  # sysctl — ip_forward теперь на всех нодах
+  mkdir -p "$dir/etc/sysctl.d"
+  ssh root@"$ip" 'cat /etc/sysctl.d/99-forwarding.conf 2>/dev/null || true' \
+    > "$dir/etc/sysctl.d/99-forwarding.conf"
+
   echo "    done"
 done
 
 echo "=== Collecting pve1-specific configs ==="
-cp /etc/dnsmasq.d/homelab.conf      "$BASELINE/pve1/etc/dnsmasq.d/homelab.conf"
-cp /etc/iptables/rules.v4           "$BASELINE/pve1/etc/iptables/rules.v4"
-cp /etc/sysctl.d/99-forwarding.conf "$BASELINE/pve1/etc/sysctl.d/99-forwarding.conf"
+# dnsmasq только на pve1 — DHCP + DNS для lab.internal
+# iptables и sysctl уже собраны в per-node loop выше
+mkdir -p "$BASELINE/pve1/etc/dnsmasq.d"
+cp /etc/dnsmasq.d/homelab.conf "$BASELINE/pve1/etc/dnsmasq.d/homelab.conf"
 
 echo "=== Collecting cluster SDN config ==="
 SDN_DST="$BASELINE/cluster/etc/pve/sdn"
